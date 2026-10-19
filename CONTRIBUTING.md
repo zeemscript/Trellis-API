@@ -84,6 +84,9 @@ npm run diagnostics
 # For a faster check that skips network probes:
 npm run diagnostics:quick
 
+# Details, failure modes, and safe recovery:
+# docs/DEVELOPER_DIAGNOSTICS.md
+
 # Start development server
 npm run start:dev
 
@@ -107,6 +110,18 @@ npm run sandbox:demo
 
 # Sandbox test suite
 npm run test:sandbox
+```
+
+### Deterministic Fixtures for Testing
+
+Contributors can generate seedable, repeatable test datasets covering standard user operations, edge cases, corrupt payloads, auth failure states, and boundary conditions.
+
+```bash
+# Generate deterministic fixtures with default seed (42) to stdout
+npm run fixtures:generate
+
+# Generate fixtures with custom seed and write output to file
+npm run fixtures:generate -- --seed=12345 --output=test/fixtures/local.json
 ```
 
 Set `SANDBOX_MODE=true` in `.env` to enable it for the running API and select
@@ -152,6 +167,51 @@ quotas via:
 
 All admin quota endpoints require the `ADMIN` role.
 
+### OpenAPI Contract & Drift Check
+
+`docs/openapi.json` is the published API contract: the Redoc reference published
+by CI, the generated TypeScript/Python SDKs, and every third-party integration
+read it. It is generated from the NestJS controller decorators, so it must be
+regenerated and committed whenever a controller, route, DTO, `@Api*` decorator,
+parameter, response or component schema changes.
+
+```bash
+# Regenerate the artefact from the current decorators
+npm run openapi:export
+
+# Verify that the committed artefact still matches the decorators
+npx ts-node -r tsconfig-paths/register scripts/check-openapi-drift.ts
+```
+
+The check boots the Nest app in memory through the same code path
+`npm run openapi:export` uses (`scripts/lib/openapi-document.ts`), builds the
+document with the published metadata and `deepScanRoutes: true`, and diffs it
+against `docs/openapi.json` member by member. The comparison is structural
+rather than textual: key ordering and formatting are normalised away, while
+added/removed paths, HTTP methods and operations, changed operation members
+(`summary`, `parameters`, `requestBody`, `responses`, ...), changed component
+schemas and changed document members such as `info`, `servers` or
+`securitySchemes` are each reported with the path they belong to.
+
+CI runs it in the `openapi-drift` job of
+[.github/workflows/build-check.yml](.github/workflows/build-check.yml) on pull
+requests and on pushes to `main`/`master`:
+
+- Artefact identical to the decorators &rarr; the job passes.
+- Any drift &rarr; the job fails and prints every differing path/operation plus
+  the three commands that fix it: `npm run openapi:export`,
+  `git add docs/openapi.json` and the commit.
+- `docs/openapi.json` missing, empty, not valid JSON, or without paths &rarr; the
+  job fails with the same instructions, so deleting the artefact can never be a
+  way to make the gate pass.
+
+Both `scripts/export-openapi.ts` and the drift check import the document builder
+from `scripts/lib/openapi-document.ts`; keep that the only place that knows how
+the spec is assembled so the artefact and the gate cannot drift apart.
+
+There is no `npm run` alias for the drift check yet - invoke the script directly
+with `npx ts-node` as shown above (that is exactly what CI runs).
+
 ### Diagnostics Command
 
 Run `npm run diagnostics` at any time to verify your local setup:
@@ -160,16 +220,17 @@ Run `npm run diagnostics` at any time to verify your local setup:
 |---|---|
 | Required tools | node ≥ 18, npm, git, docker (optional), psql (optional) |
 | Dependencies | node_modules present, no critical npm audit findings |
-| Environment | All required `.env` vars set with non-placeholder values |
-| Database | TCP reachability + optional psql query |
-| Redis | TCP reachability |
-| Stellar Horizon | HTTP reachability (skipped with `--quick`) |
-| SMTP | TCP reachability (skipped with `--quick`) |
+| Environment & Auth | Required `.env` vars, secret length & entropy (`auth:JWT_SECRET`), workspace filesystem write permissions (`fs:workspace-write`) |
+| Database | TCP reachability with retries + auth handshake verification (`db:authentication`) + `public.users` table presence |
+| Redis | TCP reachability with retries and exponential backoff |
+| Stellar Horizon | HTTP reachability with retries and backoff (skipped with `--quick`) |
+| SMTP | TCP reachability with retries (skipped with `--quick`) |
 | Build | TypeScript type-check via `tsc --noEmit` (skipped with `--quick`) |
 | Tests | Runs diagnostics-related unit tests |
 
 The command exits 0 on pass/warn and exits 1 on any failure. It **never
-mutates any data**.
+mutates any data**. See [docs/DEVELOPER_DIAGNOSTICS.md](docs/DEVELOPER_DIAGNOSTICS.md)
+for comprehensive failure modes, retry details, and safe recovery procedures.
 
 ### Improving The Documentation
 

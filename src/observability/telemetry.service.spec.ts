@@ -1,5 +1,6 @@
-import { TelemetryService } from "./telemetry.service";
+import { TelemetryService, dbWriteDuration, DbWriteOperation } from "./telemetry.service";
 import { Telemetry } from "./telemetry.decorator";
+import { register } from "../config/metrics";
 import {
   businessOperationDuration,
   businessOperationTotal,
@@ -206,6 +207,246 @@ describe("TelemetryService & @Telemetry", () => {
     it("should capture error code and record failure on exception", async () => {
       const instance = new TestService();
       await expect(instance.failingMethod()).rejects.toThrow("Simulated failure");
+    });
+  });
+
+  describe("db_write_duration_seconds metrics", () => {
+    beforeEach(() => {
+      dbWriteDuration.reset();
+    });
+
+    it("should have expected histogram buckets configured", () => {
+      const expectedBuckets = [0.01, 0.05, 0.1, 0.5, 1.0, 5.0];
+      const metric = (register as any).getSingleMetric("db_write_duration_seconds");
+      expect(metric).toBeDefined();
+      expect((metric as any).bucketValues).toBeDefined();
+      // prom-client bucketValues maps to configured buckets
+      for (const bucket of expectedBuckets) {
+        expect((metric as any).bucketValues[bucket]).toBeDefined();
+      }
+    });
+
+    it("should record execution duration for entity save, insert, update, and delete calls", () => {
+      const observeSpy = jest.spyOn(dbWriteDuration, "labels");
+
+      const operations: DbWriteOperation[] = ["save", "insert", "update", "delete"];
+      for (const op of operations) {
+        service.recordDatabaseWrite({
+          operation: op,
+          entity: "UserEntity",
+          durationSeconds: 0.045,
+          status: "success",
+        });
+
+        expect(observeSpy).toHaveBeenCalledWith(op, "UserEntity", "success");
+      }
+    });
+
+    it("should measure database write duration using startDbWriteTimer helper", async () => {
+      const endTimer = service.startDbWriteTimer("insert", { entity: "Portfolio" });
+      await new Promise((r) => setTimeout(r, 15));
+      endTimer("success");
+
+      const metricsOutput = await register.metrics();
+      expect(metricsOutput).toContain('db_write_duration_seconds_bucket{le="0.05",operation="insert",entity="Portfolio",status="success"}');
+      expect(metricsOutput).toContain('db_write_duration_seconds_count{operation="insert",entity="Portfolio",status="success"} 1');
+    });
+
+    it("should measure database write callback via trackDatabaseWrite", async () => {
+      const result = await service.trackDatabaseWrite("save", "PaymentOperation", async () => {
+        await new Promise((r) => setTimeout(r, 10));
+        return { saved: true };
+      });
+
+      expect(result).toEqual({ saved: true });
+
+      const metricsOutput = await register.metrics();
+      expect(metricsOutput).toContain('operation="save"');
+      expect(metricsOutput).toContain('entity="PaymentOperation"');
+      expect(metricsOutput).toContain('status="success"');
+    });
+
+    it("should record failure status when trackDatabaseWrite throws", async () => {
+      await expect(
+        service.trackDatabaseWrite("delete", "Session", async () => {
+          throw new Error("DB lock timeout");
+        }),
+      ).rejects.toThrow("DB lock timeout");
+
+      const metricsOutput = await register.metrics();
+      expect(metricsOutput).toContain('operation="delete"');
+      expect(metricsOutput).toContain('entity="Session"');
+      expect(metricsOutput).toContain('status="failure"');
+    });
+
+    it("should expose db_write_duration_seconds on /metrics registry with valid syntax", async () => {
+      service.recordDatabaseWrite({
+        operation: "update",
+        entity: "Account",
+        durationSeconds: 0.12,
+        status: "success",
+      });
+
+      const metricsText = await register.metrics();
+      expect(metricsText).toContain("# HELP db_write_duration_seconds Duration of database write operations in seconds");
+      expect(metricsText).toContain("# TYPE db_write_duration_seconds histogram");
+      expect(metricsText).toMatch(/db_write_duration_seconds_bucket\{.*le="0\.01".*\} \d+/);
+      expect(metricsText).toMatch(/db_write_duration_seconds_bucket\{.*le="0\.05".*\} \d+/);
+      expect(metricsText).toMatch(/db_write_duration_seconds_bucket\{.*le="0\.1".*\} \d+/);
+      expect(metricsText).toMatch(/db_write_duration_seconds_bucket\{.*le="0\.5".*\} \d+/);
+      expect(metricsText).toMatch(/db_write_duration_seconds_bucket\{.*le="1".*\} \d+/);
+      expect(metricsText).toMatch(/db_write_duration_seconds_bucket\{.*le="5".*\} \d+/);
+      expect(metricsText).toMatch(/db_write_duration_seconds_bucket\{.*le="\+Inf".*\} \d+/);
+      expect(metricsText).toContain('db_write_duration_seconds_sum{operation="update",entity="Account",status="success"}');
+      expect(metricsText).toContain('db_write_duration_seconds_count{operation="update",entity="Account",status="success"} 1');
+    });
+  });
+
+  describe("high-cardinality protection (#214)", () => {
+    const REAL_JWT =
+      "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkxLUyB0ZXN0In0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c";
+
+    const ORIGINAL_BUDGET = process.env.TELEMETRY_LABEL_BUDGET;
+    const ORIGINAL_RATE = process.env.TELEMETRY_LOG_SAMPLE_RATE;
+
+    beforeEach(() => {
+      // The rejection/suppression counters are shared singletons; restore the
+      // spies earlier tests left behind so call assertions start clean.
+      jest.restoreAllMocks();
+    });
+
+    afterEach(() => {
+      if (ORIGINAL_BUDGET === undefined) delete process.env.TELEMETRY_LABEL_BUDGET;
+      else process.env.TELEMETRY_LABEL_BUDGET = ORIGINAL_BUDGET;
+      if (ORIGINAL_RATE === undefined) delete process.env.TELEMETRY_LOG_SAMPLE_RATE;
+      else process.env.TELEMETRY_LOG_SAMPLE_RATE = ORIGINAL_RATE;
+    });
+
+    it("normalizes identifier-shaped and token-shaped label values before they reach Prometheus", () => {
+      const totalSpy = jest.spyOn(businessOperationTotal, "labels");
+      const failureSpy = jest.spyOn(businessFailureTotal, "labels");
+
+      service.recordOperation({
+        operation: "wallet.550e8400-e29b-41d4-a716-446655440000",
+        actorType: "user@example.com",
+        result: "failure",
+        errorCode: `AUTH_FAILED_${REAL_JWT}`,
+        latencyMs: 10,
+      });
+
+      // Raw identifiers and tokens never become series keys; the observation
+      // is still counted under the placeholder so totals stay exact.
+      expect(totalSpy).toHaveBeenCalledWith("wallet.:uuid", ":email", "failure");
+      expect(failureSpy).toHaveBeenCalledWith(
+        "wallet.:uuid",
+        ":email",
+        "__sensitive__",
+      );
+    });
+
+    it("collapses a flood of distinct operation names into the overflow bucket once the budget is spent", () => {
+      process.env.TELEMETRY_LABEL_BUDGET = "2";
+      const sampled = new TelemetryService();
+      const totalSpy = jest.spyOn(businessOperationTotal, "labels");
+
+      for (const name of ["op_1", "op_2", "op_3", "op_4"]) {
+        sampled.recordOperation({
+          operation: name,
+          actorType: "user",
+          result: "success",
+          latencyMs: 10,
+        });
+      }
+
+      // The first two distinct values keep their series; every new value
+      // after the budget is aggregated instead of minting a series.
+      expect(totalSpy).toHaveBeenNthCalledWith(1, "op_1", "user", "success");
+      expect(totalSpy).toHaveBeenNthCalledWith(2, "op_2", "user", "success");
+      expect(totalSpy).toHaveBeenNthCalledWith(3, "__over_budget__", "user", "success");
+      expect(totalSpy).toHaveBeenNthCalledWith(4, "__over_budget__", "user", "success");
+    });
+
+    it("samples success logs deterministically, never samples failures, and never samples metrics", () => {
+      process.env.TELEMETRY_LOG_SAMPLE_RATE = "0.5";
+      const sampled = new TelemetryService();
+      const logSpy = jest.spyOn((sampled as any).logger, "log");
+      const warnSpy = jest.spyOn((sampled as any).logger, "warn");
+      const totalSpy = jest.spyOn(businessOperationTotal, "labels");
+
+      for (let i = 0; i < 4; i += 1) {
+        sampled.recordOperation({
+          operation: "wallet.sign",
+          actorType: "user",
+          result: "success",
+          latencyMs: 10,
+        });
+      }
+      sampled.recordOperation({
+        operation: "wallet.sign",
+        actorType: "user",
+        result: "failure",
+        errorCode: "REJECTED",
+        latencyMs: 10,
+      });
+
+      // Success logs land on every 2nd eligible line (deterministic cadence).
+      expect(logSpy).toHaveBeenCalledTimes(2);
+      // Failures always emit.
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      // Metrics reflect every observation exactly — sampling is log-only.
+      expect(totalSpy).toHaveBeenCalledTimes(5);
+    });
+
+    it("always emits failed funnel transitions even when sampling is aggressive", () => {
+      process.env.TELEMETRY_LOG_SAMPLE_RATE = "0";
+      const sampled = new TelemetryService();
+      const logSpy = jest.spyOn((sampled as any).logger, "log");
+
+      sampled.recordFunnelStep("onboarding", "kyc_review", "started");
+      sampled.recordFunnelStep("onboarding", "kyc_review", "completed");
+      sampled.recordFunnelStep("onboarding", "kyc_review", "failed");
+
+      // The failed transition is a failure signal; started/completed at
+      // rate 0 are suppressed (metrics still recorded — see funnel metric).
+      expect(logSpy).toHaveBeenCalledTimes(1);
+      expect(logSpy.mock.calls[0][0]).toContain('"status":"failed"');
+    });
+
+    it("redacts sensitive tokens from emitted log lines", () => {
+      const warnSpy = jest.spyOn((service as any).logger, "warn");
+
+      service.recordOperation({
+        operation: "auth.check",
+        actorType: "user",
+        result: "failure",
+        errorCode: REAL_JWT,
+        latencyMs: 10,
+      });
+
+      const line = warnSpy.mock.calls[0][0] as string;
+      expect(line).not.toContain(REAL_JWT);
+      expect(line).toContain("REDACTED");
+    });
+
+    it("caps oversized metadata on the log line but not on the returned event", () => {
+      const logSpy = jest.spyOn((service as any).logger, "log");
+      const metadata = { payload: "x".repeat(10_000) };
+
+      const event = service.recordOperation({
+        operation: "batch.import",
+        actorType: "service_actor",
+        result: "success",
+        latencyMs: 10,
+        metadata,
+      });
+
+      // Callers keep the full object — the caps bound stdout, not the API.
+      expect(event.metadata).toEqual(metadata);
+
+      const line = logSpy.mock.calls[0][0] as string;
+      expect(line.length).toBeLessThan(4096);
+      expect(line).toContain('"_truncated":true');
+      expect(line).not.toContain("x".repeat(1_000));
     });
   });
 });

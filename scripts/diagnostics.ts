@@ -21,6 +21,17 @@ import * as fs from "fs";
 import * as net from "net";
 import * as http from "http";
 import * as https from "https";
+import { Client } from "pg";
+import {
+  checkBootstrapAdmin,
+  checkTcpConnectivityWithRetry,
+  checkHttpEndpointWithRetry,
+  checkSecretEntropy,
+  checkDatabaseAuth,
+  checkDirectoryPermissions,
+  checkEnvTemplateDrift,
+  checkPortAvailable,
+} from "../src/diagnostics/diagnostics-checks";
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Colour helpers (no deps — use raw ANSI so the script runs before npm install)
@@ -99,6 +110,21 @@ function probeTcp(host: string, port: number, timeoutMs = 3000): Promise<boolean
       clearTimeout(timer);
       resolve(false);
     });
+  });
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Helper: true when nothing is listening on the port (binds, then releases it)
+// ──────────────────────────────────────────────────────────────────────────────
+function isPortFree(port: number): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", (err: NodeJS.ErrnoException) => {
+      if (err.code === "EADDRINUSE") resolve(false);
+      else reject(err);
+    });
+    server.once("listening", () => server.close(() => resolve(true)));
+    server.listen(port);
   });
 }
 
@@ -223,6 +249,18 @@ async function checkEnv(): Promise<void> {
     pass("env:.env file", ".env file exists");
   }
 
+  const readIfExists = (file: string): string | null =>
+    fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null;
+  const drift = checkEnvTemplateDrift(readIfExists(envExamplePath), readIfExists(envPath));
+  results.push(drift);
+
+  const portCheck = await checkPortAvailable(
+    "env:PORT",
+    parseInt(process.env.PORT || "3001", 10),
+    isPortFree,
+  );
+  results.push(portCheck);
+
   // Required vars
   const required: Array<{ key: string; description: string; remediation: string }> = [
     {
@@ -254,6 +292,34 @@ async function checkEnv(): Promise<void> {
     } else {
       pass(`env:${key}`, `${key} is set`);
     }
+  }
+
+  if (process.env.JWT_SECRET) {
+    const entropy = checkSecretEntropy("JWT_SECRET", process.env.JWT_SECRET);
+    if (entropy.status === "pass") {
+      pass(entropy.name, entropy.detail);
+    } else if (entropy.status === "warn") {
+      warn(entropy.name, entropy.detail, entropy.remediation);
+    } else {
+      fail(entropy.name, entropy.detail, entropy.remediation || "");
+    }
+  }
+
+  // Workspace filesystem write permission check
+  const fsPerm = checkDirectoryPermissions("fs:workspace-write", ROOT, (dir) => {
+    try {
+      const probePath = path.join(dir, `.diag-probe-${Date.now()}.tmp`);
+      fs.writeFileSync(probePath, "probe");
+      fs.unlinkSync(probePath);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  if (fsPerm.status === "pass") {
+    pass(fsPerm.name, fsPerm.detail);
+  } else {
+    fail(fsPerm.name, fsPerm.detail, fsPerm.remediation || "");
   }
 
   // Optional-but-recommended vars
@@ -292,38 +358,105 @@ async function checkDatabase(): Promise<void> {
 
   try {
     const url = new URL(dbUrl);
+    if (url.protocol !== "postgres:" && url.protocol !== "postgresql:") {
+      throw new Error("Unsupported database URL protocol");
+    }
     host = url.hostname;
     port = parseInt(url.port || "5432", 10);
   } catch {
-    warn("db:url-parse", "Could not parse DATABASE_URL as a URL", "Ensure DATABASE_URL is a valid postgresql:// URI");
-  }
-
-  // TCP reachability
-  const tcpOk = await probeTcp(host, port);
-  if (!tcpOk) {
     fail(
-      "db:tcp",
-      `Cannot reach PostgreSQL at ${host}:${port}`,
-      `Ensure PostgreSQL is running.\n` +
-        `Quick start: docker run -d --name trellis-pg -e POSTGRES_PASSWORD=password -p ${port}:5432 postgres:16\n` +
-        `Then update DATABASE_URL accordingly.`,
+      "db:url-parse",
+      "DATABASE_URL is not a valid PostgreSQL URL",
+      "Set DATABASE_URL using the postgresql://user:password@host:5432/database format.",
     );
     return;
   }
-  pass("db:tcp", `PostgreSQL TCP reachable at ${host}:${port}`);
 
-  // Try a query via psql if available
-  const psqlOut = runCmd(`psql "${dbUrl}" -c "SELECT version();" 2>&1`);
-  if (psqlOut && psqlOut.includes("PostgreSQL")) {
-    pass("db:query", "PostgreSQL SELECT version() succeeded");
-  } else if (psqlOut === null) {
-    warn("db:query", "psql not available — skipping query check", "Install postgresql-client for a full connectivity test");
-  } else {
-    fail(
-      "db:query",
-      `psql query failed: ${psqlOut?.slice(0, 200)}`,
-      "Check DATABASE_URL credentials.\nRun: psql \"$DATABASE_URL\" -c 'SELECT 1;'",
+  // TCP reachability with retries
+  const tcpCheck = await checkTcpConnectivityWithRetry(
+    "db:tcp",
+    host,
+    port,
+    probeTcp,
+    `Ensure PostgreSQL is running.\n` +
+      `Quick start: docker run -d --name trellis-pg -e POSTGRES_PASSWORD=password -p ${port}:5432 postgres:16\n` +
+      `Then update DATABASE_URL accordingly.`,
+    { maxAttempts: 2, backoffMs: 150 },
+  );
+  if (tcpCheck.status !== "pass") {
+    fail(tcpCheck.name, tcpCheck.detail, tcpCheck.remediation || "");
+    return;
+  }
+  pass(tcpCheck.name, tcpCheck.detail);
+
+  let client: Client | undefined;
+  try {
+    client = new Client({
+      connectionString: dbUrl,
+      connectionTimeoutMillis: 3000,
+    });
+    await client.connect();
+    await client.query("SELECT 1");
+    const dbAuth = checkDatabaseAuth({ connected: true, authenticated: true });
+    pass(dbAuth.name, dbAuth.detail);
+
+    const schema = await client.query<{ users_table: string | null }>(
+      "SELECT to_regclass('public.users') AS users_table",
     );
+    if (!schema.rows[0]?.users_table) {
+      fail(
+        "db:schema",
+        "The public.users table is missing",
+        "Run the project's database initialization/migrations, then start the API once to apply the configured schema setup.",
+      );
+    } else {
+      pass("db:schema", "The public.users table exists");
+      const bootstrapEmail = process.env.ADMIN_BOOTSTRAP_EMAIL?.trim();
+      const bootstrapWallet = process.env.ADMIN_BOOTSTRAP_WALLET?.trim();
+      if (bootstrapEmail || bootstrapWallet) {
+        const user = await client.query<{ role: string }>(
+           `SELECT role FROM public.users
+            WHERE ($1::text IS NOT NULL AND lower(email) = lower($1))
+              OR ($1::text IS NULL AND $2::text IS NOT NULL
+                AND lower("walletAddress") = lower($2))
+            LIMIT 1`,
+          [bootstrapEmail || null, bootstrapWallet || null],
+        );
+        results.push(
+          checkBootstrapAdmin(
+            bootstrapEmail,
+            bootstrapWallet,
+            user.rows[0]?.role,
+          ),
+        );
+      } else {
+        skip(
+          "db:bootstrap-admin",
+          "No ADMIN_BOOTSTRAP_EMAIL or ADMIN_BOOTSTRAP_WALLET configured; no bootstrap admin is expected",
+        );
+      }
+    }
+  } catch (err: any) {
+    const message = err?.message || "";
+    let errorCategory: "auth_failed" | "unreachable" | "db_missing" | "none" = "none";
+    if (message.includes("password authentication failed") || err?.code === "28P01" || err?.code === "28000") {
+      errorCategory = "auth_failed";
+    } else if (err?.code === "3D000" || message.includes("does not exist")) {
+      errorCategory = "db_missing";
+    } else {
+      errorCategory = "unreachable";
+    }
+    const dbAuth = checkDatabaseAuth({
+      connected: false,
+      authenticated: false,
+      errorCategory,
+      errorMessage: message,
+    });
+    fail(dbAuth.name, dbAuth.detail, dbAuth.remediation || "");
+  } finally {
+    if (client) {
+      await client.end().catch(() => undefined);
+    }
   }
 }
 
@@ -350,16 +483,19 @@ async function checkRedis(): Promise<void> {
     warn("redis:url-parse", "Could not parse REDIS_URL", "Use format: redis://localhost:6379");
   }
 
-  const tcpOk = await probeTcp(host, port);
-  if (!tcpOk) {
-    fail(
-      "redis:tcp",
-      `Cannot reach Redis at ${host}:${port}`,
-      `Start Redis: docker run -d --name trellis-redis -p 6379:6379 redis:7-alpine\n` +
-        `Or: brew services start redis`,
-    );
+  const tcpCheck = await checkTcpConnectivityWithRetry(
+    "redis:tcp",
+    host,
+    port,
+    probeTcp,
+    `Start Redis: docker run -d --name trellis-redis -p 6379:6379 redis:7-alpine\n` +
+      `Or: brew services start redis`,
+    { maxAttempts: 2, backoffMs: 150 },
+  );
+  if (tcpCheck.status !== "pass") {
+    fail(tcpCheck.name, tcpCheck.detail, tcpCheck.remediation || "");
   } else {
-    pass("redis:tcp", `Redis TCP reachable at ${host}:${port}`);
+    pass(tcpCheck.name, tcpCheck.detail);
   }
 }
 
@@ -377,15 +513,21 @@ async function checkStellar(): Promise<void> {
   const horizonUrl =
     process.env.STELLAR_HORIZON_URL ?? "https://horizon-testnet.stellar.org";
 
-  const result = await probeHttp(`${horizonUrl}/`);
-  if (result.ok && result.status && result.status < 500) {
-    pass("stellar:horizon", `Stellar Horizon reachable at ${horizonUrl} (HTTP ${result.status})`);
+  const result = await checkHttpEndpointWithRetry(
+    "stellar:horizon",
+    `${horizonUrl}/`,
+    probeHttp,
+    `Check your internet connection.\n` +
+      `Set STELLAR_HORIZON_URL in .env (default: https://horizon-testnet.stellar.org).`,
+    { maxAttempts: 2, backoffMs: 200 },
+  );
+  if (result.status === "pass") {
+    pass(result.name, result.detail);
   } else {
     warn(
-      "stellar:horizon",
-      `Stellar Horizon unreachable at ${horizonUrl}`,
-      `Check your internet connection.\n` +
-        `Set STELLAR_HORIZON_URL in .env (default: https://horizon-testnet.stellar.org).`,
+      result.name,
+      result.detail,
+      result.remediation,
     );
   }
 }
@@ -414,15 +556,22 @@ async function checkSmtp(): Promise<void> {
     return;
   }
 
-  const tcpOk = await probeTcp(smtpHost, smtpPort, 4000);
-  if (tcpOk) {
-    pass("smtp:tcp", `SMTP TCP reachable at ${smtpHost}:${smtpPort}`);
+  const tcpCheck = await checkTcpConnectivityWithRetry(
+    "smtp:tcp",
+    smtpHost,
+    smtpPort,
+    (h, p) => probeTcp(h, p, 4000),
+    `Check SMTP_HOST and SMTP_PORT in your .env.\n` +
+      `For local dev, use Ethereal (https://ethereal.email) or Mailhog (docker run -p 1025:1025 mailhog/mailhog).`,
+    { maxAttempts: 2, backoffMs: 150 },
+  );
+  if (tcpCheck.status === "pass") {
+    pass(tcpCheck.name, tcpCheck.detail);
   } else {
     warn(
-      "smtp:tcp",
-      `Cannot reach SMTP at ${smtpHost}:${smtpPort}`,
-      `Check SMTP_HOST and SMTP_PORT in your .env.\n` +
-        `For local dev, use Ethereal (https://ethereal.email) or Mailhog (docker run -p 1025:1025 mailhog/mailhog).`,
+      tcpCheck.name,
+      tcpCheck.detail,
+      tcpCheck.remediation,
     );
   }
 }

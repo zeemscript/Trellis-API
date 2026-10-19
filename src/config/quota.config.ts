@@ -131,3 +131,44 @@ export const QUOTA_LEVELS: Record<string, QuotaConfig> = {
 };
 
 export const DEFAULT_QUOTA = QUOTA_LEVELS.free;
+
+/**
+ * Monthly API call quota limits per tenant plan tier.
+ * Used by the quota guard to enforce monthly usage counters in Redis.
+ */
+export const MONTHLY_QUOTA_LIMITS = {
+  free: 10_000,
+  pro: 1_000_000,
+  enterprise: Number.POSITIVE_INFINITY,
+} as const;
+
+export type MonthlyQuotaTier = keyof typeof MONTHLY_QUOTA_LIMITS;
+
+/**
+ * Resolve the monthly quota limat for a given tier. Enterprise tiers return
+ * `Number.POSITIVE_INFINITY` to signal "unlimited".
+ */
+export function getMonthlyQuotaLimit(tier: MonthlyQuotaTier): number {
+  return MONTHLY_QUOTA_LIMITS[tier];
+}
+
+/**
+ * Normalize an arbitrary tier string into a monthly quota tier.
+ */
+export function normalizeMonthlyQuotaTier(
+  value?: string | null,
+): MonthlyQuotaTier {
+  const normalized = String(value ?? "")
+    .trim()
+    .toLowerCase();
+
+  if (normalized === "pro" || normalized === "paid") {
+    return "pro";
+  }
+
+  if (normalized === "enterprise" || normalized === "internal") {
+    return "enterprise";
+  }
+
+  return "free";
+}

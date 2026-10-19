@@ -9,11 +9,23 @@ import {
   ConnectedSocket,
   WsException,
 } from "@nestjs/websockets";
+import { OnModuleDestroy } from "@nestjs/common";
 import { Server, Socket } from "socket.io";
-import { Logger, UseFilters, UsePipes, ValidationPipe } from "@nestjs/common";
+import { Logger, Optional, UseFilters, UsePipes, ValidationPipe } from "@nestjs/common";
+import { WsTicketService } from "./services/ws-ticket.service";
+import { DashboardWebSocketAuthAdapter } from "./adapters/dashboard-ws-auth.adapter";
 import { SpanStatusCode } from "@opentelemetry/api";
 import { createSpan, extractContext } from "../../config/tracing";
+import {
+  clearWebsocketSubscriptions,
+  setWebsocketSubscriptions,
+  trackWebsocketConnectionClosed,
+  trackWebsocketConnectionOpened,
+  trackWebsocketError,
+  trackWebsocketMessagePublished,
+} from "../../config/metrics";
 import { JwtService } from "@nestjs/jwt";
+import { createGatewayCorsOptions } from "../../config/cors.config";
 import { ConnectionManagerService } from "./services/connection-manager.service";
 import { EventBufferService } from "./services/event-buffer.service";
 import { DashboardMetricsService } from "./services/dashboard-metrics.service";
@@ -28,28 +40,42 @@ import {
 
 @WebSocketGateway({
   namespace: "/dashboard",
-  cors: {
-    origin: "*",
-    credentials: true,
-  },
+  // Issue #83: the gateway used to accept `origin: "*"` with credentials,
+  // exposing an authenticated session to any site. It now shares the HTTP
+  // allow-list, so a browser can only open a dashboard socket from an origin an
+  // operator actually named.
+  cors: createGatewayCorsOptions(),
   pingInterval: 30000, // 30 second heartbeat interval
   pingTimeout: 5000, // 5 second timeout for pong response
 })
 @UseFilters(WsExceptionFilter)
 @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
 export class DashboardGateway
-  implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect
+  implements
+    OnGatewayInit,
+    OnGatewayConnection,
+    OnGatewayDisconnect,
+    OnModuleDestroy
 {
   @WebSocketServer()
   server: Server;
 
   private readonly logger = new Logger(DashboardGateway.name);
 
+  /**
+   * Issue #96: the heartbeat and stale-connection timers used to be fire-and-
+   * forget `setInterval` calls. They are now tracked so a shutdown (or a stress
+   * test) can release them instead of leaving two timers per gateway behind.
+   */
+  private readonly timers = new Set<NodeJS.Timeout>();
+
   constructor(
     private readonly connectionManager: ConnectionManagerService,
     private readonly eventBuffer: EventBufferService,
     private readonly metricsService: DashboardMetricsService,
     private readonly jwtService: JwtService,
+    @Optional() private readonly ticketService?: WsTicketService,
+    @Optional() private readonly authAdapter?: DashboardWebSocketAuthAdapter,
   ) {}
 
   async afterInit(server: Server) {
@@ -60,6 +86,21 @@ export class DashboardGateway
 
     // Initialize stale connection cleanup
     this.startStaleConnectionCleanup();
+  }
+
+  onModuleDestroy(): void {
+    for (const timer of this.timers) {
+      clearInterval(timer);
+    }
+    this.timers.clear();
+  }
+
+  /** Register a periodic task and keep a handle so it can be cleared. */
+  private schedule(task: () => void, everyMs: number): void {
+    const timer = setInterval(task, everyMs);
+    // Never let a background timer hold the process (or a test run) open.
+    timer.unref?.();
+    this.timers.add(timer);
   }
 
   async handleConnection(client: Socket) {
@@ -76,28 +117,79 @@ export class DashboardGateway
 
     try {
       // Authenticate the client
-      const token = this.extractToken(client);
-      if (!token) {
-        this.logger.warn(
-          `Connection rejected: No token provided for client ${client.id}`,
-        );
-        client.emit("error", {
-          code: "AUTH_REQUIRED",
-          message: "Authentication token required",
-        });
-        client.disconnect(true);
-        return;
+      let userId: string | null = null;
+
+      // 1. Check if socket was already authenticated (e.g., via adapter)
+      if ((client as any).user?.id) {
+        userId = (client as any).user.id;
+      } else if (this.authAdapter) {
+        const authenticated = await this.authAdapter.authenticate(client);
+        if (authenticated && (client as any).user?.id) {
+          userId = (client as any).user.id;
+        }
       }
 
-      const payload = this.jwtService.verify(token);
-      const userId = payload.sub || payload.userId;
+      // 2. Authenticate via single-use ticket
+      if (!userId && this.ticketService) {
+        const ticket = this.extractTicket(client);
+        if (ticket) {
+          const ticketData = await this.ticketService.validateAndConsumeTicket(ticket);
+          if (ticketData?.userId) {
+            userId = ticketData.userId;
+            (client as any).user = { id: userId, ...ticketData };
+          } else {
+            this.logger.warn(
+              `Connection rejected: Invalid or expired ticket for client ${client.id}`,
+            );
+            client.emit("error", {
+              code: "AUTH_FAILED",
+              message: "Invalid or expired authentication ticket",
+            });
+            client.disconnect(true);
+            return;
+          }
+        }
+      }
+
+      // 3. Fallback: Check header/auth object JWT (disallow long-lived query tokens)
+      if (!userId) {
+        const queryToken = client.handshake.query?.token;
+        if (queryToken && typeof queryToken === "string") {
+          this.logger.warn(
+            `Connection rejected: Long-lived query tokens disabled for client ${client.id}`,
+          );
+          client.emit("error", {
+            code: "QUERY_TOKENS_DISABLED",
+            message:
+              "Long-lived tokens in query parameters are disabled. Use single-use tickets from POST /api/ws/ticket.",
+          });
+          client.disconnect(true);
+          return;
+        }
+
+        const token = this.extractToken(client);
+        if (!token) {
+          this.logger.warn(
+            `Connection rejected: No token or ticket provided for client ${client.id}`,
+          );
+          client.emit("error", {
+            code: "AUTH_REQUIRED",
+            message: "Authentication ticket or token required",
+          });
+          client.disconnect(true);
+          return;
+        }
+
+        const payload = this.jwtService.verify(token);
+        userId = payload.sub || payload.userId;
+      }
 
       if (!userId) {
         throw new Error("Invalid token: missing user ID");
       }
 
       // Register connection in connection manager (with empty subscriptions array)
-      await this.connectionManager.registerConnection(client.id, {
+      const registered = await this.connectionManager.registerConnection(client.id, {
         userId,
         clientId: client.id,
         connectedAt: new Date(),
@@ -105,6 +197,19 @@ export class DashboardGateway
         isAlive: true,
         subscriptions: [], // Initialize with empty subscriptions
       });
+      if (!registered) {
+        client.emit("error", {
+          code: "MAX_CONNECTIONS_EXCEEDED",
+          message: "Maximum WebSocket connections for this user exceeded",
+        });
+        client.disconnect(true);
+        return;
+      }
+
+      // Issue #143: record the open connection against the dashboard
+      // transport. Counted here, after authentication succeeds, so an
+      // unauthenticated socket that is rejected never inflates the gauge.
+      trackWebsocketConnectionOpened("dashboard");
 
       // Join user room for broadcasting
       client.join(`user:${userId}`);
@@ -163,6 +268,10 @@ export class DashboardGateway
 
     const connectionInfo = this.connectionManager.getConnectionInfo(client.id);
 
+    // Issue #143: decrement the same transport the open incremented, so the
+    // gauge cannot drift above zero after a clean disconnect.
+    trackWebsocketConnectionClosed("dashboard");
+
     if (connectionInfo) {
       // Keep connection info for event buffering (up to 5 minutes)
       this.connectionManager.markDisconnected(client.id);
@@ -219,6 +328,14 @@ export class DashboardGateway
 
     this.connectionManager.subscribeToPortfolio(client.id, portfolioId);
 
+    // Issue #143: keep the per-portfolio subscription gauge equal to the
+    // number of live subscribers. Recomputed from the connection manager
+    // rather than incremented, so a double-subscribe cannot drift it.
+    setWebsocketSubscriptions(
+      portfolioId,
+      this.connectionManager.getPortfolioSubscribers(portfolioId).length,
+    );
+
     this.logger.log(
       `Client ${client.id} subscribed to portfolio ${portfolioId}`,
     );
@@ -241,6 +358,16 @@ export class DashboardGateway
 
     client.leave(`portfolio:${portfolioId}`);
     this.connectionManager.unsubscribeFromPortfolio(client.id, portfolioId);
+
+    // Issue #143: the gauge is recomputed from the connection manager; when
+    // the last subscriber leaves it is explicitly zeroed rather than left to
+    // drift.
+    const remaining = this.connectionManager.getPortfolioSubscribers(portfolioId).length;
+    if (remaining === 0) {
+      clearWebsocketSubscriptions(portfolioId);
+    } else {
+      setWebsocketSubscriptions(portfolioId, remaining);
+    }
 
     return {
       event: DashboardEvent.UNSUBSCRIPTION_CONFIRMED,
@@ -277,11 +404,25 @@ export class DashboardGateway
 
   // Broadcast methods for server-side use
   broadcastToPortfolio(portfolioId: string, event: DashboardEvent, data: any) {
-    this.server.to(`portfolio:${portfolioId}`).emit(event, data);
+    // Issue #143: a publish that throws is counted, so a failing broadcast is
+    // visible as a rate rather than as silently missing traffic.
+    try {
+      this.server.to(`portfolio:${portfolioId}`).emit(event, data);
+      trackWebsocketMessagePublished(event);
+    } catch (error) {
+      trackWebsocketError("publish_failed");
+      throw error;
+    }
   }
 
   broadcastToUser(userId: string, event: DashboardEvent, data: any) {
-    this.server.to(`user:${userId}`).emit(event, data);
+    try {
+      this.server.to(`user:${userId}`).emit(event, data);
+      trackWebsocketMessagePublished(event);
+    } catch (error) {
+      trackWebsocketError("publish_failed");
+      throw error;
+    }
   }
 
   // Buffer event during disconnection
@@ -293,6 +434,33 @@ export class DashboardGateway
     });
   }
 
+  private extractTicket(client: Socket): string | null {
+    const queryTicket = client.handshake.query?.ticket;
+    if (typeof queryTicket === "string" && queryTicket.trim()) {
+      return queryTicket.trim();
+    }
+
+    const authTicket = (client.handshake.auth as any)?.ticket;
+    if (typeof authTicket === "string" && authTicket.trim()) {
+      return authTicket.trim();
+    }
+
+    const headerTicket = client.handshake.headers["x-ws-ticket"];
+    if (typeof headerTicket === "string" && headerTicket.trim()) {
+      return headerTicket.trim();
+    }
+
+    const queryToken = client.handshake.query?.token;
+    if (
+      typeof queryToken === "string" &&
+      (queryToken.startsWith("wst_") || queryToken.startsWith("ticket_"))
+    ) {
+      return queryToken.trim();
+    }
+
+    return null;
+  }
+
   private extractToken(client: Socket): string | null {
     // Try authorization header first
     const authHeader = client.handshake.headers.authorization;
@@ -300,18 +468,13 @@ export class DashboardGateway
       return authHeader.substring(7);
     }
 
-    // Try auth query parameter
+    // Try auth object
     const tokenQuery = client.handshake.auth?.token;
-    if (tokenQuery) {
+    if (tokenQuery && typeof tokenQuery === "string") {
       return tokenQuery;
     }
 
-    // Try query parameter
-    const tokenQueryParam = client.handshake.query?.token;
-    if (typeof tokenQueryParam === "string") {
-      return tokenQueryParam;
-    }
-
+    // Prohibit query parameter tokens
     return null;
   }
 
@@ -321,7 +484,7 @@ export class DashboardGateway
 
   private startHealthMonitoring() {
     // Send heartbeat check every 30 seconds
-    setInterval(() => {
+    this.schedule(() => {
       this.server.emit(DashboardEvent.HEARTBEAT, {
         timestamp: new Date().toISOString(),
       });
@@ -330,7 +493,7 @@ export class DashboardGateway
 
   private startStaleConnectionCleanup() {
     // Check for stale connections every 60 seconds
-    setInterval(async () => {
+    this.schedule(async () => {
       const staleConnections = this.connectionManager.getStaleConnections(
         5 * 60 * 1000,
       ); // 5 minutes
